@@ -25,5 +25,6 @@
 * Then you calculate attention weights as: q @ torch.transpose(k, -1, -2) // head_dim ** 0.5 (scaled dot product attention)  --> this will have shape (batch_size, num_patches + 1, num_heads, num_heads)
 * You convert attention weights into attention scores by taking softmax torch.softmax(attention_scores, dim=-1) --> this will have shape (batch_size, num_patches + 1, num_heads, num_heads)
 * output = attention_scores @ v --> this will have shape (batch_size, num_patches + 1, num_heads, head_size)
-* We then concatenate all the heads together to get back emb_dim so output is --> (batch_size, num_patches + 1, emb_dim)
+* We then concatenate all the heads together to get back emb_dim so output (which is attention_scores @ v and then reshaped) is --> (batch_size, num_patches + 1, emb_dim)
+* 
     
