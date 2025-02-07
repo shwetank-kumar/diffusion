@@ -306,7 +306,7 @@ if __name__ == "__main__":
         vit=vit,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=50,
+        num_epochs=150,
         max_lr=4e-5,
         max_grad_norm=1.0,
         weight_decay=5e-2,
