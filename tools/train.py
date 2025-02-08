@@ -170,7 +170,6 @@ def train_vit(
     
     # Training loop
     for epoch in range(start_epoch, num_epochs):
-        time.sleep(0.1)
         epoch_start_time = time.time()
         
         # Training phase
@@ -178,10 +177,14 @@ def train_vit(
         running_train_loss = 0.0
         
         for batch_idx, (images, targets) in enumerate(train_loader):
+            if batch_idx % 50 == 0:  # Check temperature every 50 batches
+                if not check_gpu_temperature():
+                    time.sleep(20)
+            
             with accelerator.accumulate(vit):
                 optimizer.zero_grad()
                 outputs = vit(images)
-                loss = F.cross_entropy(outputs, targets)
+                loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
                 
                 # Backward pass with accelerator
                 accelerator.backward(loss)
@@ -289,6 +292,16 @@ def train_vit(
         
     return train_losses, val_losses
 
+def check_gpu_temperature(max_temp=85):
+    # Get GPU temperature using nvidia-smi
+    temp = os.popen('nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader').read()
+    if temp:
+        gpu_temp = int(temp.strip())
+        if gpu_temp > max_temp:
+            print(f"GPU temperature is too high: {gpu_temp}°C. Pausing training.")
+            return False
+    return True
+
 if __name__ == "__main__":
     # Create VIT configuration
     img_size = 224
@@ -301,7 +314,9 @@ if __name__ == "__main__":
     num_heads = 12
     num_layers = 12
     hidden_dim = 4*emb_dim
-    dropout = 0.1
+    dropout = 0.2
+    weight_decay = 0.1
+    label_smoothing = 0.1
     n_classes = 100
     img_shape = (H,W)
     
@@ -322,14 +337,14 @@ if __name__ == "__main__":
         transforms.Resize(img_size),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.CIFAR10),  # Add AutoAugment
         transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.5071, 0.4867, 0.4408],
             std=[0.2675, 0.2565, 0.2761]
-        )
+        ),
+        transforms.RandomErasing(p=0.3)  # Add random erasing
     ])
 
     val_transform = transforms.Compose([
@@ -402,12 +417,12 @@ if __name__ == "__main__":
         vit=vit,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=100,
+        num_epochs=75,
         max_lr=4e-5,
         max_grad_norm=1.0,
-        weight_decay=5e-2,
+        weight_decay=weight_decay,
         val_freq=1,
-        patience=10,
+        patience=15,
         checkpoint_dir="checkpoints",
         resume_training=True  # Set to True to resume from latest checkpoint
     )
