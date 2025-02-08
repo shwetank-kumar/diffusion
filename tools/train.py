@@ -6,10 +6,7 @@ from models.vit import VIT
 import torchvision.transforms as transforms
 import torchvision
 import torch
-import sys
-import os
 import time
-import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -19,109 +16,63 @@ import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import OneCycleLR
 import logging
+import json
+from pathlib import Path
 
 
-## Create VIT configuration
-img_size = 224
-C = 3
-H = img_size
-W = img_size
-patch_size = 16
-num_patches = H*W // patch_size**2
-emb_dim = 768
-num_heads = 12
-num_layers = 12
-hidden_dim = 4*emb_dim
-dropout = 0.1
-n_classes = 100
-img_shape = (H,W)
-print(f"Number of channels (C): {C}")
-print(f"Height (H): {H}")
-print(f"Width (W): {W}")
-print(f"Patch size (patch_size): {patch_size}")
-print(f"Number of patches (num_patches): {num_patches}")
-print(f"Embedding dimension (emb_dim): {emb_dim}")
-print(f"Number of heads (num_heads): {num_heads}")
-print(f"Head dimension: {emb_dim // num_heads}")
-print(f"Number of transformer layers (num_layers): {num_layers}")
-print(f"Hidden dimensions: {hidden_dim}")
-print(f"Number of classes: {n_classes}")
+def save_checkpoint(
+    accelerator, 
+    vit, 
+    optimizer, 
+    scheduler, 
+    epoch, 
+    train_losses, 
+    val_losses,
+    best_val_loss,
+    no_improve,
+    checkpoint_dir
+):
+    """Save training checkpoint"""
+    if accelerator.is_main_process:
+        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
+        unwrapped_model = accelerator.unwrap_model(vit)
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': unwrapped_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'best_val_loss': best_val_loss,
+            'no_improve': no_improve
+        }
+        
+        accelerator.save(checkpoint, checkpoint_path)
+        
+        # Save latest checkpoint reference
+        with open(os.path.join(checkpoint_dir, "latest_checkpoint.txt"), "w") as f:
+            f.write(checkpoint_path)
 
+def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
+    """Load training checkpoint"""
+    if not os.path.exists(checkpoint_path):
+        return None
+        
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    vit.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    return checkpoint
 
-## Create dataloaders
-train_transform = transforms.Compose([
-    transforms.Resize(img_size),  # First resize to 224x224
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),  # Keep crop size at 224
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.5071, 0.4867, 0.4408],
-        std=[0.2675, 0.2565, 0.2761]
-    )
-])
-
-val_transform = transforms.Compose([
-    transforms.Resize(224),  # Also resize validation images
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.5071, 0.4867, 0.4408],
-        std=[0.2675, 0.2565, 0.2761]
-    )
-])
-
-# cifar100 = torchvision.datasets.CIFAR100(root='../datasets', download=True)
-cifar100_train = torchvision.datasets.CIFAR100(
-    root='./datasets', 
-    train=True,  # Important: Specify train=True
-    transform=train_transform,
-    download=True
-)
-
-cifar100_val = torchvision.datasets.CIFAR100(
-    root='./datasets', 
-    train=False,  # Using training set for validation
-    transform=val_transform,
-    download=True
-)
-
-# Create DataLoaders for training and validation
-batch_size = 128
-train_loader = torch.utils.data.DataLoader(
-    cifar100_train, batch_size=batch_size, shuffle=True, num_workers=12, pin_memory=True 
-)
-val_loader = torch.utils.data.DataLoader(
-    cifar100_val, batch_size=batch_size, shuffle=False, num_workers=12
-)
-
-dataiter = iter(train_loader)
-images, targets = next(dataiter)
-
-
-vit = VIT(
-    num_layers=num_layers,
-    num_heads=num_heads,
-    emb_dim=emb_dim,
-    hidden_dim=hidden_dim,
-    patch_size=patch_size,
-    C=C,
-    img_shape=img_shape,
-    n_classes=n_classes,
-    dropout=dropout,
-)
-# Compile the model
-vit = torch.compile(vit)
-
-## Calculate number of params
-total_params = 0
-for name, param in vit.named_parameters():
-    if param.requires_grad:
-        num_params = param.numel()
-        # print(f"{name}: {num_params:,} parameters")
-        total_params += num_params
-print(f"Total trainable parameters: {total_params:,}")
+def get_latest_checkpoint(checkpoint_dir):
+    """Get the path of the latest checkpoint"""
+    latest_file = os.path.join(checkpoint_dir, "latest_checkpoint.txt")
+    if os.path.exists(latest_file):
+        with open(latest_file, "r") as f:
+            return f.read().strip()
+    return None
 
 def train_vit(
     vit,
@@ -134,7 +85,12 @@ def train_vit(
     seed=42,
     val_freq=1,  # Validate every n epochs
     patience=10,  # Early stopping patience
+    checkpoint_dir="checkpoints",
+    resume_training=False
 ):
+    # Create checkpoint directory
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
     # Initialize accelerator
     accelerator = Accelerator(
         mixed_precision='bf16',
@@ -182,19 +138,39 @@ def train_vit(
         final_div_factor=1000.0
     )
     
+    # Training metrics
+    start_epoch = 0
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    no_improve = 0
+
+    # Resume from checkpoint if requested
+    if resume_training:
+        latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
+        if latest_checkpoint:
+            logger.info(f"Resuming from checkpoint: {latest_checkpoint}")
+            checkpoint = load_checkpoint(latest_checkpoint, vit, optimizer, scheduler)
+            if checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                train_losses = checkpoint['train_losses']
+                val_losses = checkpoint['val_losses']
+                best_val_loss = checkpoint['best_val_loss']
+                no_improve = checkpoint['no_improve']
+                logger.info(f"Resuming from epoch {start_epoch}")
+            else:
+                logger.warning("No checkpoint found, starting from scratch")
+        else:
+            logger.warning("No checkpoint found, starting from scratch")
+    
     # Prepare for distributed training
     vit, optimizer, train_loader, val_loader = accelerator.prepare(
         vit, optimizer, train_loader, val_loader
     )
     
-    # Training metrics
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    no_improve = 0  # Counter for early stopping
-    
     # Training loop
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
+        time.sleep(0.1)
         epoch_start_time = time.time()
         
         # Training phase
@@ -265,6 +241,20 @@ def train_vit(
                         logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                     break
         
+        # Save checkpoint
+        save_checkpoint(
+            accelerator,
+            vit,
+            optimizer,
+            scheduler,
+            epoch,
+            train_losses,
+            val_losses,
+            best_val_loss,
+            no_improve,
+            checkpoint_dir
+        )
+        
         # Log metrics
         if accelerator.is_main_process:
             epoch_time = time.time() - epoch_start_time
@@ -299,17 +289,125 @@ def train_vit(
         
     return train_losses, val_losses
 
-# Main execution
 if __name__ == "__main__":
-    # Call training function
+    # Create VIT configuration
+    img_size = 224
+    C = 3
+    H = img_size
+    W = img_size
+    patch_size = 16
+    num_patches = H*W // patch_size**2
+    emb_dim = 768
+    num_heads = 12
+    num_layers = 12
+    hidden_dim = 4*emb_dim
+    dropout = 0.1
+    n_classes = 100
+    img_shape = (H,W)
+    
+    print(f"Number of channels (C): {C}")
+    print(f"Height (H): {H}")
+    print(f"Width (W): {W}")
+    print(f"Patch size (patch_size): {patch_size}")
+    print(f"Number of patches (num_patches): {num_patches}")
+    print(f"Embedding dimension (emb_dim): {emb_dim}")
+    print(f"Number of heads (num_heads): {num_heads}")
+    print(f"Head dimension: {emb_dim // num_heads}")
+    print(f"Number of transformer layers (num_layers): {num_layers}")
+    print(f"Hidden dimensions: {hidden_dim}")
+    print(f"Number of classes: {n_classes}")
+
+    # Create data transforms
+    train_transform = transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],
+            std=[0.2675, 0.2565, 0.2761]
+        )
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],
+            std=[0.2675, 0.2565, 0.2761]
+        )
+    ])
+
+    # Create datasets
+    cifar100_train = torchvision.datasets.CIFAR100(
+        root='./datasets', 
+        train=True,
+        transform=train_transform,
+        download=True
+    )
+
+    cifar100_val = torchvision.datasets.CIFAR100(
+        root='./datasets', 
+        train=False,
+        transform=val_transform,
+        download=True
+    )
+
+    # Create dataloaders
+    batch_size = 128
+    train_loader = torch.utils.data.DataLoader(
+        cifar100_train, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=12, 
+        pin_memory=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        cifar100_val, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=12
+    )
+
+    # Initialize model
+    vit = VIT(
+        num_layers=num_layers,
+        num_heads=num_heads,
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        patch_size=patch_size,
+        C=C,
+        img_shape=img_shape,
+        n_classes=n_classes,
+        dropout=dropout,
+    )
+    
+    # Compile model
+    vit = torch.compile(vit)
+
+    # Calculate and print number of parameters
+    total_params = 0
+    for name, param in vit.named_parameters():
+        if param.requires_grad:
+            num_params = param.numel()
+            print(f"{name}: {num_params:,} parameters")
+            total_params += num_params
+    print(f"Total trainable parameters: {total_params:,}")
+
+    # Train the model
     train_losses, val_losses = train_vit(
         vit=vit,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=150,
+        num_epochs=100,
         max_lr=4e-5,
         max_grad_norm=1.0,
         weight_decay=5e-2,
-        val_freq=10,  # Validate every epoch
-        patience=10,  # Early stopping patience
+        val_freq=1,
+        patience=10,
+        checkpoint_dir="checkpoints",
+        resume_training=True  # Set to True to resume from latest checkpoint
     )
