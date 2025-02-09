@@ -54,6 +54,18 @@ def save_checkpoint(
         with open(os.path.join(checkpoint_dir, "latest_checkpoint.txt"), "w") as f:
             f.write(checkpoint_path)
 
+# def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
+#     """Load training checkpoint"""
+#     if not os.path.exists(checkpoint_path):
+#         return None
+        
+#     checkpoint = torch.load(checkpoint_path, map_location='cpu')
+#     vit.load_state_dict(checkpoint['model_state_dict'])
+#     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+#     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+#     return checkpoint
+
 def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
     """Load training checkpoint"""
     if not os.path.exists(checkpoint_path):
@@ -62,7 +74,8 @@ def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     vit.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if scheduler is not None:  # Only load scheduler state if scheduler is provided
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     return checkpoint
 
@@ -73,6 +86,31 @@ def get_latest_checkpoint(checkpoint_dir):
         with open(latest_file, "r") as f:
             return f.read().strip()
     return None
+
+def check_gpu_temperature(accelerator, max_temp=80):
+    """Check GPU temperature for the current process's GPU."""
+    print(f" Starting temperature check.")
+    try:
+        # Get GPU temperatures using nvidia-smi
+        temp = os.popen('nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader').read()
+        if temp:
+            # Split temperatures into a list (one per GPU)
+            gpu_temps = temp.strip().split('\n')
+            
+            # Get the temperature for the current GPU (based on local_rank)
+            local_rank = accelerator.local_process_index
+            if local_rank < len(gpu_temps):
+                gpu_temp = int(gpu_temps[local_rank])
+                print(f"GPU {local_rank} temperature: {gpu_temp}°C")  # Print temperature
+                if gpu_temp > max_temp:
+                    print(f"GPU {local_rank} temperature is too high: {gpu_temp}°C. Pausing training.")
+                    return False
+            else:
+                print(f"No temperature data for GPU {local_rank}. Skipping temperature check.")
+        return True
+    except Exception as e:
+        print(f"Temperature check failed: {e}. Skipping check.")
+        return True
 
 def train_vit(
     vit,
@@ -124,21 +162,7 @@ def train_vit(
         betas=(0.9, 0.999)
     )
     
-    # Calculate total steps for scheduler
-    total_steps = len(train_loader) * num_epochs
-    
-    # Initialize scheduler
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=max_lr,
-        total_steps=total_steps,
-        pct_start=0.3,
-        anneal_strategy='cos',
-        div_factor=25.0,
-        final_div_factor=1000.0
-    )
-    
-    # Training metrics
+    # Initialize training metrics
     start_epoch = 0
     train_losses = []
     val_losses = []
@@ -150,7 +174,7 @@ def train_vit(
         latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
         if latest_checkpoint:
             logger.info(f"Resuming from checkpoint: {latest_checkpoint}")
-            checkpoint = load_checkpoint(latest_checkpoint, vit, optimizer, scheduler)
+            checkpoint = load_checkpoint(latest_checkpoint, vit, optimizer, None)  # Don't load scheduler state
             if checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
                 train_losses = checkpoint['train_losses']
@@ -162,6 +186,20 @@ def train_vit(
                 logger.warning("No checkpoint found, starting from scratch")
         else:
             logger.warning("No checkpoint found, starting from scratch")
+            
+    # Calculate remaining steps and initialize scheduler
+    remaining_epochs = num_epochs - start_epoch
+    total_steps = len(train_loader) * remaining_epochs
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        total_steps=total_steps,
+        pct_start=0.3,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=1000.0
+    )
     
     # Prepare for distributed training
     vit, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -175,12 +213,9 @@ def train_vit(
         # Training phase
         vit.train()
         running_train_loss = 0.0
+        num_batches = 0
         
         for batch_idx, (images, targets) in enumerate(train_loader):
-            if batch_idx % 50 == 0:  # Check temperature every 50 batches
-                if not check_gpu_temperature():
-                    time.sleep(20)
-            
             with accelerator.accumulate(vit):
                 optimizer.zero_grad()
                 outputs = vit(images)
@@ -196,11 +231,12 @@ def train_vit(
                 scheduler.step()
                 
                 running_train_loss += loss.item()
+                num_batches += 1
         
-        # Calculate average training loss
-        train_loss = running_train_loss / len(train_loader)
+        # Calculate average training loss for the epoch
+        train_loss = running_train_loss / num_batches
         train_losses.append(train_loss)
-        
+            
         # Validation phase (run every val_freq epochs)
         val_loss = None
         accuracy = None
@@ -291,16 +327,6 @@ def train_vit(
         )
         
     return train_losses, val_losses
-
-def check_gpu_temperature(max_temp=85):
-    # Get GPU temperature using nvidia-smi
-    temp = os.popen('nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader').read()
-    if temp:
-        gpu_temp = int(temp.strip())
-        if gpu_temp > max_temp:
-            print(f"GPU temperature is too high: {gpu_temp}°C. Pausing training.")
-            return False
-    return True
 
 if __name__ == "__main__":
     # Create VIT configuration
@@ -408,7 +434,7 @@ if __name__ == "__main__":
     for name, param in vit.named_parameters():
         if param.requires_grad:
             num_params = param.numel()
-            print(f"{name}: {num_params:,} parameters")
+            # print(f"{name}: {num_params:,} parameters")
             total_params += num_params
     print(f"Total trainable parameters: {total_params:,}")
 
@@ -417,8 +443,8 @@ if __name__ == "__main__":
         vit=vit,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=75,
-        max_lr=4e-5,
+        num_epochs=150,
+        max_lr=8e-4,
         max_grad_norm=1.0,
         weight_decay=weight_decay,
         val_freq=1,
