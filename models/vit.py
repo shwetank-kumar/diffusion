@@ -140,17 +140,21 @@ class VIT(nn.Module):
         
         self.norm = nn.LayerNorm(emb_dim)
         # self.lin = nn.Linear(emb_dim, n_classes)
-        self.lin = nn.Sequential(
+        self.pre_head = nn.Sequential(
             nn.Linear(emb_dim, emb_dim),
             nn.Tanh(),
-            nn.Linear(emb_dim, n_classes)
         )
+        self.head = nn.Linear(emb_dim, n_classes)
         
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         x = self.patch_embedding(x)
         for layer in self.xfls:
             x = layer(x)
         x = self.norm(x)
         x = x[:, 0]  # Get CLS token
-        x = self.lin(x)
-        return x
+        features = self.pre_head(x)
+        logits = self.head(features)
+        
+        if return_features:
+            return features, logits
+        return logits

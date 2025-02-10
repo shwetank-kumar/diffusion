@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 import logging
 import json
 from pathlib import Path
-
+import numpy as np
 
 def save_checkpoint(
     accelerator, 
@@ -54,17 +54,12 @@ def save_checkpoint(
         with open(os.path.join(checkpoint_dir, "latest_checkpoint.txt"), "w") as f:
             f.write(checkpoint_path)
 
-# def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
-#     """Load training checkpoint"""
-#     if not os.path.exists(checkpoint_path):
-#         return None
-        
-#     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-#     vit.load_state_dict(checkpoint['model_state_dict'])
-#     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-#     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-#     return checkpoint
+def print_gpu_memory():
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        print(f"GPU Memory allocated: {allocated:.2f}GB")
+        print(f"GPU Memory reserved: {reserved:.2f}GB")
 
 def load_checkpoint(checkpoint_path, vit, optimizer, scheduler):
     """Load training checkpoint"""
@@ -111,6 +106,33 @@ def check_gpu_temperature(accelerator, max_temp=80):
     except Exception as e:
         print(f"Temperature check failed: {e}. Skipping check.")
         return True
+    
+def harmonic_loss(features, targets, model, n=28, temperature=0.1):
+    if hasattr(model, 'module'):
+        W = model.module.head.weight
+    else:
+        W = model.head.weight
+    
+    # Normalize features and weights
+    features = F.normalize(features, dim=1)
+    W = F.normalize(W, dim=1)
+    
+    # Scale distances by temperature
+    dists = torch.cdist(features, W) * temperature
+    
+    if not hasattr(harmonic_loss, 'printed'):
+        print(f"Normalized features mean: {features.mean().item():.4f}, std: {features.std().item():.4f}")
+        print(f"Normalized weight mean: {W.mean().item():.4f}, std: {W.std().item():.4f}")
+        print(f"Scaled distances mean: {dists.mean().item():.4f}, std: {dists.std().item():.4f}")
+        print(f"Min dist: {dists.min().item():.4f}, Max dist: {dists.max().item():.4f}")
+        harmonic_loss.printed = True
+    
+    inv_dists = 1 / (dists.pow(n) + 1e-6)
+    probs = inv_dists / (inv_dists.sum(dim=1, keepdim=True) + 1e-6)
+    
+    loss = F.nll_loss(torch.log(probs + 1e-6), targets)
+    return loss
+
 
 def train_vit(
     vit,
@@ -153,6 +175,12 @@ def train_vit(
         logger.info(f"Mixed precision: {accelerator.mixed_precision}")
         logger.info(f"Validation frequency: every {val_freq} epochs")
         logger.info(f"Early stopping patience: {patience} epochs")
+       
+        # Add GPU memory info to logging
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            logger.info(f"Initial GPU Memory: {allocated:.2f}GB/{reserved:.2f}GB")
     
     # Initialize optimizer
     optimizer = optim.AdamW(
@@ -218,8 +246,10 @@ def train_vit(
         for batch_idx, (images, targets) in enumerate(train_loader):
             with accelerator.accumulate(vit):
                 optimizer.zero_grad()
-                outputs = vit(images)
-                loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
+                # outputs = vit(images)
+                # loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
+                features, logits = vit(images, return_features=True) 
+                loss = harmonic_loss(features, targets, vit, n = min(5 + (epoch / 50) * (np.sqrt(emb_dim) - 5), np.sqrt(emb_dim)))
                 
                 # Backward pass with accelerator
                 accelerator.backward(loss)
@@ -249,18 +279,32 @@ def train_vit(
             
             with torch.no_grad():
                 for images, targets in val_loader:
-                    outputs = vit(images)
-                    loss = F.cross_entropy(outputs, targets)
+                    # outputs = vit(images)
+                    # loss = F.cross_entropy(outputs, targets)
+                    # running_val_loss += loss.item()
+                    
+                    # # Calculate accuracy
+                    # _, predicted = outputs.max(1)
+                    # total += targets.size(0)
+                    # correct += predicted.eq(targets).sum().item()
+                    
+                    features, logits = vit(images, return_features=True)
+                    # Use harmonic loss for validation loss
+                    loss = harmonic_loss(features, targets, vit, n=np.sqrt(emb_dim))
                     running_val_loss += loss.item()
                     
-                    # Calculate accuracy
-                    _, predicted = outputs.max(1)
+                    # Calculate accuracy using logits
+                    _, predicted = logits.max(1)
                     total += targets.size(0)
                     correct += predicted.eq(targets).sum().item()
+    
             
             val_loss = running_val_loss / len(val_loader)
             accuracy = 100. * correct / total
             val_losses.append(val_loss)
+            
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
             # Early stopping check
             if val_loss < best_val_loss:
@@ -279,6 +323,10 @@ def train_vit(
                     if accelerator.is_main_process:
                         logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                     break
+                
+        if accelerator.is_main_process and torch.cuda.is_available():
+            print_gpu_memory()
+            torch.cuda.empty_cache()
         
         # Save checkpoint
         save_checkpoint(
