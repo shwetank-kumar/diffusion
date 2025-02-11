@@ -16,9 +16,8 @@ import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import OneCycleLR
 import logging
-import json
 from pathlib import Path
-import numpy as np
+import yaml
 
 def save_checkpoint(
     accelerator, 
@@ -107,33 +106,12 @@ def check_gpu_temperature(accelerator, max_temp=80):
         print(f"Temperature check failed: {e}. Skipping check.")
         return True
     
-def harmonic_loss(features, targets, model, n=28, temperature=0.1):
-    if hasattr(model, 'module'):
-        W = model.module.head.weight
-    else:
-        W = model.head.weight
+# Loading a YAML file
+def load_config(config_path):
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+    return config
     
-    # Normalize features and weights
-    features = F.normalize(features, dim=1)
-    W = F.normalize(W, dim=1)
-    
-    # Scale distances by temperature
-    dists = torch.cdist(features, W) * temperature
-    
-    if not hasattr(harmonic_loss, 'printed'):
-        print(f"Normalized features mean: {features.mean().item():.4f}, std: {features.std().item():.4f}")
-        print(f"Normalized weight mean: {W.mean().item():.4f}, std: {W.std().item():.4f}")
-        print(f"Scaled distances mean: {dists.mean().item():.4f}, std: {dists.std().item():.4f}")
-        print(f"Min dist: {dists.min().item():.4f}, Max dist: {dists.max().item():.4f}")
-        harmonic_loss.printed = True
-    
-    inv_dists = 1 / (dists.pow(n) + 1e-6)
-    probs = inv_dists / (inv_dists.sum(dim=1, keepdim=True) + 1e-6)
-    
-    loss = F.nll_loss(torch.log(probs + 1e-6), targets)
-    return loss
-
-
 def train_vit(
     vit,
     train_loader,
@@ -185,7 +163,7 @@ def train_vit(
     # Initialize optimizer
     optimizer = optim.AdamW(
         vit.parameters(),
-        lr=max_lr/25,  # base learning rate
+        lr=max_lr/25.,  # base learning rate
         weight_decay=weight_decay,
         betas=(0.9, 0.999)
     )
@@ -246,10 +224,8 @@ def train_vit(
         for batch_idx, (images, targets) in enumerate(train_loader):
             with accelerator.accumulate(vit):
                 optimizer.zero_grad()
-                # outputs = vit(images)
-                # loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
-                features, logits = vit(images, return_features=True) 
-                loss = harmonic_loss(features, targets, vit, n = min(5 + (epoch / 50) * (np.sqrt(emb_dim) - 5), np.sqrt(emb_dim)))
+                outputs = vit(images)
+                loss = F.cross_entropy(outputs, targets, label_smoothing=label_smoothing)
                 
                 # Backward pass with accelerator
                 accelerator.backward(loss)
@@ -279,25 +255,14 @@ def train_vit(
             
             with torch.no_grad():
                 for images, targets in val_loader:
-                    # outputs = vit(images)
-                    # loss = F.cross_entropy(outputs, targets)
-                    # running_val_loss += loss.item()
-                    
-                    # # Calculate accuracy
-                    # _, predicted = outputs.max(1)
-                    # total += targets.size(0)
-                    # correct += predicted.eq(targets).sum().item()
-                    
-                    features, logits = vit(images, return_features=True)
-                    # Use harmonic loss for validation loss
-                    loss = harmonic_loss(features, targets, vit, n=np.sqrt(emb_dim))
+                    outputs = vit(images)
+                    loss = F.cross_entropy(outputs, targets)
                     running_val_loss += loss.item()
                     
-                    # Calculate accuracy using logits
-                    _, predicted = logits.max(1)
+                    # Calculate accuracy
+                    _, predicted = outputs.max(1)
                     total += targets.size(0)
                     correct += predicted.eq(targets).sum().item()
-    
             
             val_loss = running_val_loss / len(val_loader)
             accuracy = 100. * correct / total
@@ -377,38 +342,65 @@ def train_vit(
     return train_losses, val_losses
 
 if __name__ == "__main__":
-    # Create VIT configuration
-    img_size = 224
-    C = 3
-    H = img_size
-    W = img_size
-    patch_size = 16
-    num_patches = H*W // patch_size**2
-    emb_dim = 768
-    num_heads = 12
-    num_layers = 12
-    hidden_dim = 4*emb_dim
-    dropout = 0.2
-    weight_decay = 0.1
-    label_smoothing = 0.1
-    n_classes = 100
-    img_shape = (H,W)
     
-    print(f"Number of channels (C): {C}")
-    print(f"Height (H): {H}")
-    print(f"Width (W): {W}")
-    print(f"Patch size (patch_size): {patch_size}")
-    print(f"Number of patches (num_patches): {num_patches}")
+    config = load_config('./config/vit_config.yaml')
+    
+    ## Dataset params
+    dir = config['dataset_params']['dir']
+    batch_size = config['dataset_params']['batch_size']
+    n_workers = config['dataset_params']['n_workers']
+    ### 
+    print(f"Dataset directory: {dir}")
+    print(f"Batch size: {batch_size}")
+    print(f"Number of workers: {n_workers}")
+    
+    ## Model params
+    channels = config['model_params']['channels']
+    image_height = config['model_params']['image_height']
+    image_width = config['model_params']['image_width']
+    patch_height = config['model_params']['patch_height']
+    patch_width = config['model_params']['patch_width']
+    emb_dim = config['model_params']['emb_dim']
+    n_heads = config['model_params']['n_heads']
+    n_layers = config['model_params']['n_layers']
+    hidden_dim = config['model_params']['hidden_dim']
+    dropout = config['model_params']['dropout']
+    n_classes = config['model_params']['n_classes']
+    ###
+    print(f"Number of channels (C): {channels}")
+    print(f"Height (H): {image_height}")
+    print(f"Width (W): {image_width}")
+    print(f"Patch size (patch_size): {patch_height}")
+    # print(f"Number of patches (num_patches): {num_patches}")
     print(f"Embedding dimension (emb_dim): {emb_dim}")
-    print(f"Number of heads (num_heads): {num_heads}")
-    print(f"Head dimension: {emb_dim // num_heads}")
-    print(f"Number of transformer layers (num_layers): {num_layers}")
+    print(f"Number of heads (num_heads): {n_heads}")
+    print(f"Number of transformer layers (num_layers): {n_layers}")
     print(f"Hidden dimensions: {hidden_dim}")
+    print(f"Dropout: {dropout}")   
     print(f"Number of classes: {n_classes}")
+    # print(f"Head dimension: {emb_dim // num_heads}")
+    
+    ## Training params
+    n_epochs = config['training_params']['n_epochs']
+    max_lr = config['training_params']['max_lr']
+    max_grad_norm = config['training_params']['max_grad_norm']
+    weight_decay = config['training_params']['weight_decay']
+    patience = config['training_params']['patience']
+    label_smoothing = config['training_params']['label_smoothing']
+    ### 
+    print(f"Number of epochs: {n_epochs}")
+    print(f"Max lr: {max_lr}")
+    print(f"Max grad norm: {max_grad_norm}")
+    print(f"Label smoothing: {label_smoothing}")
+    
+    ## Eval params
+    val_freq = config['eval_params']['val_freq']
+    ### 
+    print(f"Evaluation frequency: {val_freq}")
 
     # Create data transforms
     train_transform = transforms.Compose([
-        transforms.Resize(img_size),
+        transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.CIFAR10),  # Add AutoAugment
@@ -430,54 +422,53 @@ if __name__ == "__main__":
         )
     ])
 
-    # Create datasets
+    # # Create datasets
     cifar100_train = torchvision.datasets.CIFAR100(
-        root='./datasets', 
+        root=dir, 
         train=True,
         transform=train_transform,
         download=True
     )
 
     cifar100_val = torchvision.datasets.CIFAR100(
-        root='./datasets', 
+        root=dir, 
         train=False,
         transform=val_transform,
         download=True
     )
 
-    # Create dataloaders
-    batch_size = 128
+    ## Create dataloaders
     train_loader = torch.utils.data.DataLoader(
         cifar100_train, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=12, 
+        num_workers=n_workers, 
         pin_memory=True
     )
     val_loader = torch.utils.data.DataLoader(
         cifar100_val, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=12
+        num_workers=n_workers
     )
 
-    # Initialize model
+    ## Initialize model
     vit = VIT(
-        num_layers=num_layers,
-        num_heads=num_heads,
+        num_layers=n_layers,
+        num_heads=n_heads,
         emb_dim=emb_dim,
         hidden_dim=hidden_dim,
-        patch_size=patch_size,
-        C=C,
-        img_shape=img_shape,
+        patch_size=patch_height,
+        C=channels,
+        img_shape=(image_height, image_width),
         n_classes=n_classes,
         dropout=dropout,
     )
     
-    # Compile model
+    ## Compile model
     vit = torch.compile(vit)
 
-    # Calculate and print number of parameters
+    ## Calculate and print number of parameters
     total_params = 0
     for name, param in vit.named_parameters():
         if param.requires_grad:
@@ -486,17 +477,17 @@ if __name__ == "__main__":
             total_params += num_params
     print(f"Total trainable parameters: {total_params:,}")
 
-    # Train the model
+    # # Train the model
     train_losses, val_losses = train_vit(
         vit=vit,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=150,
-        max_lr=8e-4,
-        max_grad_norm=1.0,
+        num_epochs=n_epochs,
+        max_lr=max_lr,
+        max_grad_norm=max_grad_norm,
         weight_decay=weight_decay,
         val_freq=1,
-        patience=15,
+        patience=patience,
         checkpoint_dir="checkpoints",
         resume_training=True  # Set to True to resume from latest checkpoint
     )
