@@ -343,7 +343,7 @@ def train_vit(
 
 if __name__ == "__main__":
     
-    config = load_config('./config/vit_config.yaml')
+    config = load_config('./config/vit_fmnist.yaml')
     
     ## Dataset params
     dir = config['dataset_params']['dir']
@@ -403,34 +403,25 @@ if __name__ == "__main__":
         transforms.Resize((image_height, image_width)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.CIFAR10),  # Add AutoAugment
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(image_height, scale=(0.8, 1.0)),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.5071, 0.4867, 0.4408],
-            std=[0.2675, 0.2565, 0.2761]
-        ),
         transforms.RandomErasing(p=0.3)  # Add random erasing
     ])
 
     val_transform = transforms.Compose([
-        transforms.Resize(224),
+        transforms.Resize(image_height),
         transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.5071, 0.4867, 0.4408],
-            std=[0.2675, 0.2565, 0.2761]
-        )
     ])
 
     # # Create datasets
-    cifar100_train = torchvision.datasets.CIFAR100(
+    ds_train = torchvision.datasets.FashionMNIST(
         root=dir, 
         train=True,
         transform=train_transform,
         download=True
     )
 
-    cifar100_val = torchvision.datasets.CIFAR100(
+    ds_val = torchvision.datasets.FashionMNIST(
         root=dir, 
         train=False,
         transform=val_transform,
@@ -439,14 +430,14 @@ if __name__ == "__main__":
 
     ## Create dataloaders
     train_loader = torch.utils.data.DataLoader(
-        cifar100_train, 
+        ds_train, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=n_workers, 
         pin_memory=True
     )
     val_loader = torch.utils.data.DataLoader(
-        cifar100_val, 
+        ds_val, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=n_workers
